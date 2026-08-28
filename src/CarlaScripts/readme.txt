@@ -1,0 +1,1 @@
+Folder contains all of my custom Carla python APi scripts and the PythoAPI folder contains all of the Python API scripts provided by the developers of the simulator. These are often called upon by my scripts as they have a lot of useful functionality like logic for manual steering, automatic driving, camera logic e.t.c.

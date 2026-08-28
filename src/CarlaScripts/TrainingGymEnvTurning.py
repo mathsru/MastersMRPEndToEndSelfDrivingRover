@@ -1,0 +1,651 @@
+#Alex Eliseev
+#This script runs training episodes of RL inside Carla on world 5, spawnning the car at spawn 299 and having it drive down the road past a total of 4 traffic lights. It is rewarded for braking on the reds and punished for running them.
+#Similarily it gains reward for moving during a green and punished for standing still.
+#Imports
+import glob
+import os
+import sys
+import random
+import time
+import numpy as np
+import cv2
+from pathlib import Path
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque #This is needed to make the prioritized replay.
+import random
+import copy
+from ultralytics import YOLO
+#Importing model soft actor critic which can work with gradient values
+#Initla setup, connecting to carla and creating the camera and setting up the yolo model view
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CARLA_API = PROJECT_ROOT / "src" / "CarlaScripts" / "PythonAPI" 
+sys.path.append(os.path.join(CARLA_API, "carla"))
+sys.path.append(os.path.join(CARLA_API, "examples"))
+
+try:
+    sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
+        sys.version_info.major,
+        sys.version_info.minor,
+        'win-amd64' if os.name == 'nt' else 'linux-x86_64'))[0])
+except IndexError:
+    pass 
+
+import carla
+
+#Loading Yolo traffic light recognition model
+MODEL_PATH = PROJECT_ROOT / "Models" / "YOLOV8TrafficLightAndSignRecognition" / "TrafficLightsOnly_Yolov8_60_Epochs_720P" / "weights" / "best.pt"
+TrafficLightModel = YOLO(str(MODEL_PATH))
+TrafficLightModel.to("cuda")
+
+#Function for accessing the current frame view of the camera
+LatestFrame = None
+IM_WIDTH = 720
+IM_HEIGHT = 720
+def process_image(image):
+    global LatestFrame
+    array = np.frombuffer(image.raw_data,dtype=np.uint8)
+    array = array.reshape(IM_HEIGHT,IM_WIDTH,4)
+    LatestFrame = array[:,:,:3].copy()
+    #cv2.imshow("Camera",LatestFrame)
+    #cv2.waitKey(1)
+
+#Setting up GYM environment for Stable Baselines 3 library of RL
+import gymnasium as gym
+from gymnasium import spaces
+class TrainingGymEnvTurning(gym.Env):
+    def __init__(self):
+        import random
+        super().__init__()
+        self.client = carla.Client("localhost",2000)
+        self.client.set_timeout(10.0)
+        self.world = self.client.load_world("Town05")
+        settings = self.world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = 0.05
+        self.world.apply_settings(settings)
+        for _ in range(50):
+            self.world.tick()
+        self.actor_list = []
+        self.warmup_time = 5.0
+        self.action = 0
+        self.episode_start_time = None
+        #Reworked action space from discrete to continuos
+        # Continuous controls:
+        #
+        # action[0] = longitudinal control
+        #   -1.0 = full brake
+        #    0.0 = coast
+        #   +1.0 = full throttle
+        #
+        # action[1] = steering
+        #   -1.0 = full left
+        #    0.0 = straight
+        #   +1.0 = full right
+        self.action_space = spaces.Box(
+            low=np.array([-1.0, -1.0], dtype=np.float32),
+            high=np.array([1.0, 1.0], dtype=np.float32),
+            dtype=np.float32
+        )
+        self.episode_reward = 0
+        self.episode_number = 1
+        #Logging episodes ran and rewards over time
+        self.log_file = (
+            PROJECT_ROOT
+            / "Models"
+            / "ReinforcementLearningModelsCarla"
+            / "SAC_Braking_And_Steering"
+            / "training_log.csv"
+        )
+        if not self.log_file.exists():
+            with open(self.log_file, "w") as f:
+                f.write("Episode,Reward,NumberOfBrakesOnARed,Reason\n")
+        #Small if to keep writing from the last episode in the log file, assuming training it continuing
+        if self.log_file.exists():
+            import pandas as pd
+            df = pd.read_csv(self.log_file)
+            if len(df) > 0:
+                self.episode_number = int(df["Episode"].iloc[-1]) + 1
+            else:
+                self.episode_number = 1
+        else:
+            self.episode_number = 1
+        #Observation space (what is being fed into the model as input features)
+        #Model knows the cars current speed, if red light is detected and the camera view
+        self.observation_space = spaces.Dict({
+            "image": spaces.Box(
+                low=0,
+                high=255,
+                shape=(128, 128, 3),
+                dtype=np.uint8
+            ),
+            "red_light": spaces.Box(
+                low=0,
+                high=1,
+                shape=(1,),
+                dtype=np.float32
+            ),
+            "current_car_speed": spaces.Box(
+                low=0,
+                high=60,
+                shape=(1,),
+                dtype=np.float32
+            ),
+            "lane_offset": spaces.Box(
+                low=-2.0,
+                high=2.0,
+                shape=(1,),
+                dtype=np.float32
+            ),
+            "outside_lane": spaces.Box(
+                low=0,
+                high=1,
+                shape=(1,),
+                dtype=np.float32
+            )
+        })
+        #Setting traffic lights
+        self.traffic_lights = self.world.get_actors().filter("traffic.traffic_light*")
+
+        #Always starting with a green for 30 sec, spawn very close to the light
+        self.light_timer = 0
+        self.light_phase = 2             
+        self.current_cycle_duration = 15.0
+
+        for light in self.traffic_lights:
+            light.set_state(carla.TrafficLightState.Green)
+
+        for light in self.traffic_lights:
+            light.freeze(True)
+        self.vehicle = None
+        self.end_location = None
+        self.red_counter = 0 #Red light detected counter
+        self.stopped_on_red = 0
+        self.red_light_memory = 0
+        self.previous_speed = 0
+        self.braking_on_a_red = 0
+        self.vehicle_half_width = 1.0
+
+    #Function to start a new training episode, car spawns at spawn point 201, goes towards intersection light, respawns after passing the light new episode begins
+    def reset(self,seed=None,options=None):
+        self.episode_reward = 0
+        self.red_counter = 0
+        self.stopped_on_red = 0
+        self.action = 0
+        self.previous_speed = 0
+        self.braking_on_a_red = 0
+        global LatestFrame
+        LatestFrame = None
+        super().reset(seed=seed)
+        self.cleanup()
+        self.traffic_lights = self.world.get_actors().filter("traffic.traffic_light*")
+
+        self.light_timer = 0
+        self.light_phase = 2
+        self.current_cycle_duration = 15.0
+
+        for light in self.traffic_lights:
+            light.set_state(carla.TrafficLightState.Green)
+
+        #Setting spawn and despawn points to 199 and 177 (yolo model good at identifying this light)
+        spawn_points = self.world.get_map().get_spawn_points()
+        START_SPAWN = 272
+        END_SPAWN = 235
+        BACKUP_END_SPAWN = 235
+        start_spawn = spawn_points[START_SPAWN]
+        self.end_location = spawn_points[END_SPAWN].location
+        self.backup_end_location = spawn_points[BACKUP_END_SPAWN].location
+
+        #SPawning the car
+        blueprint = self.world.get_blueprint_library().filter("model3")[0]
+        self.vehicle = self.world.spawn_actor(blueprint,start_spawn)
+        self.actor_list.append(self.vehicle)
+        self.world.tick()
+        self.vehicle_half_width = self.vehicle.bounding_box.extent.y
+
+        #Car will by deafuly simply drive forwards witha throttle of 0.4
+        self.vehicle.apply_control(
+            carla.VehicleControl(
+                throttle=0.4,
+                brake=0.0,
+                steer=0.0
+            )
+        )
+        #Spawnning camera
+        camera_bp = self.world.get_blueprint_library().find("sensor.camera.rgb")
+        camera_bp.set_attribute("image_size_x",str(IM_WIDTH))
+        camera_bp.set_attribute("image_size_y",str(IM_HEIGHT))
+        camera = self.world.spawn_actor(camera_bp,carla.Transform(carla.Location(x=2.5,z=0.7)),attach_to=self.vehicle)
+        camera.listen(process_image)
+        self.actor_list.append(camera)
+        
+
+        #Wait for camera
+        while LatestFrame is None:
+            self.world.tick()
+        self.episode_start_time = time.time()
+        observation = self.get_state()
+        return observation, {}
+
+    #New step function, only options for the model are to either 0, do nothing or 1, hit the brakes
+    #New step function, only options for the model are to either 0, do nothing or 1, hit the brakes
+    def step(self, action):
+        if time.time() - self.episode_start_time > 500:
+            print("Episode timeout")
+            observation = self.get_state()
+
+            reward = -1000 #Big penalty for timeout and trying to farm the red infinently
+            self.episode_reward += reward
+
+            with open(self.log_file, "a") as f:
+                f.write(
+                    f"{self.episode_number},"
+                    f"{self.episode_reward:.2f},"
+                    f"{self.braking_on_a_red},"
+                    f"Timeout\n"
+                )
+
+            self.episode_number += 1
+            return observation, reward, True, False, {}
+        terminated = False
+        truncated = False
+        #Check if car is at despawn location 177, ending episode
+        if self.vehicle.get_location().distance(self.end_location) < 20:
+            #print("Destination reached!")
+            self.vehicle.apply_control(
+                carla.VehicleControl(
+                    throttle=0.0,
+                    brake=1.0,
+                    steer=0.0,
+                    hand_brake=True
+                )
+            )
+            time.sleep(0.2)
+            observation = self.get_state()
+            episode_time = time.time() - self.episode_start_time
+
+            #End reward
+            reward = 50
+
+            self.episode_reward += reward
+            with open(self.log_file, "a") as f:
+                f.write(
+                    f"{self.episode_number},"
+                    f"{self.episode_reward:.2f},"
+                    f"{self.braking_on_a_red},"
+                    f"Destination\n"
+                )
+            self.episode_number += 1
+            return observation, reward, True, False, {}
+        else: #Model chooses how much it was the wheels turned and the current speed as it is travelling
+            #print(action)
+            longitudinal = float(action[0])
+            steer = float(action[1])
+            # Make sure values stay inside legal range
+            longitudinal = np.clip(longitudinal, -1.0, 1.0)
+            steer = np.clip(steer, -1.0, 1.0)
+            # Positive = throttle
+            if longitudinal >= 0:
+                throttle = longitudinal
+                brake = 0.0
+            # Negative = brake
+            else:
+                throttle = 0.0
+                brake = -longitudinal
+            control = carla.VehicleControl(
+                throttle=float(throttle),
+                brake=float(brake),
+                steer=float(steer),
+                hand_brake=False
+            )
+            self.action = action.copy()
+        # Applying the decision for a step and seeing the reward
+        self.vehicle.apply_control(control)
+        self.update_traffic_lights()
+        self.world.tick()
+
+        observation = self.get_state()
+        reward = self.calculate_reward(observation)
+
+        self.episode_reward += reward
+
+        if self.episode_reward < -4000:
+            print("Episode failed")
+
+            observation = self.get_state()
+
+            if self.braking_on_a_red == 0:
+                reason = "Stood Still"
+            else:
+                reason = "Ran Red"
+
+            with open(self.log_file, "a") as f:
+                f.write(
+                    f"{self.episode_number},"
+                    f"{self.episode_reward:.2f},"
+                    f"{self.braking_on_a_red},"
+                    f"{reason}\n"
+                )
+
+            self.episode_number += 1
+
+            return observation, reward, True, False, {}
+
+        return observation, reward, terminated, truncated, {}
+
+    #Function returns the current state of the car, so its speed, if red light is detected and the camera view of the road ahead
+    def get_state(self):
+        #CUrrent location within driving lnae
+        lane_offset, outside_lane = self.get_lane_position()
+
+        #Current speed
+        velocity = (self.vehicle.get_velocity().length() * 3.6) #Speed in km/h
+
+        #Current camera view
+        global LatestFrame
+        frame = LatestFrame
+
+        #See if its a red light with Yolo model
+        red_light = 0
+
+        if frame is None:
+            frame = np.zeros((IM_HEIGHT, IM_WIDTH, 3), dtype=np.uint8)
+
+        
+        results = TrafficLightModel(frame, verbose=False)[0]
+        r1_frame = cv2.resize(frame,(128,128))
+
+        #Making sure Yolo model cannot pick up opposing traffic lights
+        cutoff_x = IM_WIDTH * 0.225
+        cutoff_y = IM_HEIGHT * 0.225
+        min_x = cutoff_x
+        max_x = IM_WIDTH - cutoff_x
+        min_y = cutoff_y
+        max_y = IM_HEIGHT - cutoff_y
+
+        for box in results.boxes:
+            cls = int(box.cls)
+            confidence = float(box.conf)
+
+            # Only care about red lights
+            if cls != 0:
+                continue
+
+            if confidence < 0.2:
+                continue
+
+            x1, y1, x2, y2 = box.xyxy[0]
+
+            center_x = float((x1 + x2) / 2)
+            center_y = float((y1 + y2) / 2)
+
+            # Ignore detections outside camera center region
+            if not (
+                min_x <= center_x <= max_x
+                and
+                min_y <= center_y <= max_y
+            ):
+                continue
+
+            red_light = 1
+            break
+        if self.red_light_memory == 0:
+            self.stopped_on_red = 0
+
+        if red_light == 1: #Incrementing redlight counter because a red was detected
+            self.red_counter +=1
+            self.red_light_memory = 20
+        elif self.red_light_memory > 0: #NExt 5 frames after red was detected are also considered a red, this redcues noise and frames with failed/no detection, the stream can have gaps going red, red, red, no detection, no detectction, red, red, red
+            self.red_counter += 0.1
+            red_light = 1
+            self.red_light_memory -= 1
+        else:
+            self.red_counter = 0
+
+        return {
+            "image": r1_frame,
+            "red_light": np.array(
+                [red_light],
+                dtype=np.float32
+            ),
+            "current_car_speed": np.array(
+                [velocity],
+                dtype=np.float32
+            ),
+            "lane_offset": np.array(
+                [lane_offset],
+                dtype=np.float32
+            ),
+            "outside_lane": np.array(
+                [outside_lane],
+                dtype=np.float32
+            )
+        }
+
+    #Function calculates reward based off of the current state, the model should be rewarded for stopping/moving slowly when a red light is detected, is progressively punished more and more
+    def calculate_reward(self,observation):
+        speed = observation["current_car_speed"][0]
+        red_light = observation["red_light"][0]
+        reward = 0
+        speed_drop = self.previous_speed - speed
+        self.previous_speed = speed
+
+        #REwards with regards to stopping for red lights and general movement
+        if red_light == 1 and speed < 1: #Rewarding for stopping during a red
+            reward += 7
+            if self.stopped_on_red == 0:
+                reward +=800 #Big reward for fully stopping on red, to offset high speed penalty
+            self.stopped_on_red = 1
+        elif red_light == 1 and speed < 5:
+            reward += 2
+        elif red_light == 1 and speed > 5: #Punishing for driving through a red
+            reward -= speed * 3
+        else:
+            if speed > 3:
+                reward += speed * 0.15 #Rewarding for driving/moving forwards
+            else:
+                    reward -= 7
+
+        #Rewards in regards to moving within the lanes.
+        lane_offset = observation["lane_offset"][0]
+        outside_lane = observation["outside_lane"][0]
+        #Rewarding for staying center of the lane, punishing for being farther out and massive penalty for falling out of the lane.
+        if outside_lane == 1:
+            reward -= 30
+        else:
+            reward += (
+                1.0 - min(abs(lane_offset), 1.0)
+            ) * 2.0
+
+        #print(reward)
+        #print(f"Speed: {speed:.2f} km/h | Reward: {reward}")
+        #print(self.is_driving_straight())
+        print(self.episode_reward)
+        return float(reward)
+
+    #Cleanup function
+    def cleanup(self):
+
+        #print("Cleanup called.")
+
+        for actor in self.actor_list:
+
+            try:
+                if actor is not None:
+
+                    if "sensor" in actor.type_id:
+                        actor.stop()
+
+                    destroyed = actor.destroy()
+
+                    #print(
+                    #    "Destroyed:",
+                    #    actor.type_id,
+                    #   destroyed
+                    #)
+
+            except Exception as e:
+                print("Cleanup error:", e)
+
+
+        self.actor_list.clear()
+
+        self.vehicle = None
+        self.agent = None
+
+        time.sleep(1)
+
+    #Respawns vehicle if it bypassed despawn 177
+    def respawn_vehicle(self):
+        self.cleanup()
+
+        self.red_counter = 0
+        self.stopped_on_red = 0
+        self.red_light_memory = 0
+
+        global LatestFrame
+        LatestFrame = None
+
+        spawn_points = self.world.get_map().get_spawn_points()
+
+        START_SPAWN = 272
+        start_spawn = spawn_points[START_SPAWN]
+
+        blueprint = self.world.get_blueprint_library().filter("model3")[0]
+
+        self.vehicle = self.world.spawn_actor(
+            blueprint,
+            start_spawn
+        )
+
+        self.actor_list.append(self.vehicle)
+        self.world.tick()
+
+        self.vehicle_half_width = (
+            self.vehicle.bounding_box.extent.y
+        )
+        self.vehicle.apply_control(
+            carla.VehicleControl(
+                throttle=0.4,
+                brake=0.0,
+                steer=0.0,
+                hand_brake=False
+            )
+        )
+
+        camera_bp = self.world.get_blueprint_library().find(
+            "sensor.camera.rgb"
+        )
+
+        camera_bp.set_attribute("image_size_x", str(IM_WIDTH))
+        camera_bp.set_attribute("image_size_y", str(IM_HEIGHT))
+
+        camera = self.world.spawn_actor(
+            camera_bp,
+            carla.Transform(
+                carla.Location(x=2.5,z=0.7)
+            ),
+            attach_to=self.vehicle
+        )
+
+        camera.listen(process_image)
+
+        self.actor_list.append(camera)
+
+        while LatestFrame is None:
+            self.world.tick()
+
+    def update_traffic_lights(self):
+
+        self.light_timer += 0.05
+
+        # GREEN
+        if self.light_phase == 0:
+            if self.light_timer >= self.current_cycle_duration:
+                self.light_timer = 0
+                self.light_phase = 2
+
+                # Random red duration
+                self.current_cycle_duration = random.choice([10.0, 15.0, 20.0])
+
+                for light in self.traffic_lights:
+                    light.set_state(carla.TrafficLightState.Red)
+
+        # RED
+        elif self.light_phase == 2:
+            if self.light_timer >= self.current_cycle_duration:
+                self.light_timer = 0
+                self.light_phase = 0
+
+                # Random green duration
+                self.current_cycle_duration = random.choice([10.0, 15.0, 20.0])
+
+                for light in self.traffic_lights:
+                    light.set_state(carla.TrafficLightState.Green)
+
+    #Function calculates current location of the car relative to the lanes.
+    def get_lane_position(self):
+
+        vehicle_location = self.vehicle.get_location()
+
+        waypoint = self.world.get_map().get_waypoint(
+            vehicle_location,
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving
+        )
+
+        if waypoint is None:
+            return 2.0, 1
+
+        lane_center = waypoint.transform.location
+        right_vector = waypoint.transform.get_right_vector()
+
+        dx = vehicle_location.x - lane_center.x
+        dy = vehicle_location.y - lane_center.y
+        dz = vehicle_location.z - lane_center.z
+
+        lateral_distance = (
+            dx * right_vector.x +
+            dy * right_vector.y +
+            dz * right_vector.z
+        )
+
+        lane_width = waypoint.lane_width
+
+        # Half width of the actual car
+        vehicle_half_width = self.vehicle_half_width
+
+        # How far the center of the vehicle may travel laterally
+        # while keeping the whole vehicle inside the lane
+        safe_distance = (
+            lane_width / 2.0
+            - vehicle_half_width
+            - 0.10
+        )
+
+        safe_distance = max(
+            safe_distance,
+            0.1
+        )
+
+        lane_offset = (
+            lateral_distance / safe_distance
+        )
+
+        lane_offset = np.clip(
+            lane_offset,
+            -2.0,
+            2.0
+        )
+
+        outside_lane = 1 if abs(lane_offset) >= 1.0 else 0
+
+        return float(lane_offset), outside_lane
+
+
+        
+
+
+
+        
